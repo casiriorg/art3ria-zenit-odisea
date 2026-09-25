@@ -1,8 +1,8 @@
 /**
  * @file zenit-odisea-device.ino
  * @brief Adquiere datos de un IMU BNO085 (I2C), un sensor GSR (analógico)
- *     y un sensor PPG MAX30102 (I2C, pulso y SpO2), y los transmite por
- *     serial en formato "TAG:valor,...".
+ *     y un sensor PPG MAX30102 (I2C, pulso y SpO2), los transmite por
+ *     serial en formato "TAG:valor,...", y controla un LED RGB.
  *
  * Proyecto: zenit-odisea-device
  *
@@ -14,6 +14,21 @@
  * Cada sensor se muestrea de forma independiente y no bloqueante (sin
  * `delay()` dentro de `loop()`), para que la lectura de uno no retrase
  * ni altere la del otro y así preservar la integridad temporal del dato.
+ *
+ * El LED RGB corre en paralelo a los sensores, sin afectar su
+ * muestreo. Hoy ejecuta una demostración fija (`TEST`, sección "LED
+ * RGB"): R, luego G, luego B, luego todos encendidos, luego ninguno,
+ * 1 segundo cada paso, de forma no bloqueante y aunque ningún sensor
+ * haya sido detectado. Esta demostración es temporal y se eliminará
+ * cuando el LED pase a reaccionar a los datos de los sensores y, más
+ * adelante, al resultado de un modelo de ML alimentado por ellos; por
+ * eso la escritura de los pines vive en una función reusable
+ * (`setLedColor`) separada de la rutina `TEST` que la usa hoy.
+ *
+ * Con `DEBUG_LEDS` en `true` (sección "LED RGB"), cada cambio de
+ * color se imprime por serial ("# LED: R=.. G=.. B=.."); por defecto
+ * está en `false` para no mezclar esas líneas con el log de los
+ * sensores (`IMU:`, `GSR:`, `PPG:`).
  */
 
 #include <Wire.h>
@@ -30,6 +45,13 @@ const uint8_t IMU_I2C_ADDR = 0x4B;
 
 Adafruit_BNO08x bno08x;
 sh2_SensorValue_t imuEvent;
+
+/**
+ * Indica si el IMU fue detectado e inicializado correctamente. Si es
+ * `false`, `readIMU()` no hace nada, pero el resto del programa (GSR,
+ * PPG, LEDs) sigue funcionando con normalidad.
+ */
+bool imuAvailable = false;
 
 // ---------------------------------------------------------------------
 // GSR
@@ -90,6 +112,13 @@ int8_t spo2Valid = 0;
 int32_t hrFromWindow = 0;
 int8_t hrFromWindowValid = 0;
 
+/**
+ * Indica si el MAX30102 fue detectado e inicializado correctamente.
+ * Si es `false`, `readPPG()` no hace nada, pero el resto del programa
+ * (IMU, GSR, LEDs) sigue funcionando con normalidad.
+ */
+bool ppgAvailable = false;
+
 /** Última lectura cruda del canal IR, usada para imprimir el dato. */
 uint32_t lastIrReading = 0;
 
@@ -125,6 +154,217 @@ bool risingEdge = false;
 unsigned long lastBeatTime = 0;
 float instantBpm = 0;
 bool instantBpmValid = false;
+
+// ---------------------------------------------------------------------
+// LED RGB
+// ---------------------------------------------------------------------
+//
+// Funciones reusables de bajo nivel para escribir en los pines del
+// LED RGB. Hoy solo las usa la demostración `TEST` de abajo, pero
+// están pensadas para que más adelante otra rutina (una animación
+// basada en los sensores, y luego una controlada por un modelo de ML)
+// las reutilice sin tener que tocar esta capa.
+
+/**
+ * Activa o desactiva la impresión por serial de la configuración de
+ * LEDs que se está mostrando en cada momento.
+ *
+ * En `true`, cada llamada a `setLedColor()` (venga de la demostración
+ * `TEST` de hoy, de una animación basada en sensores más adelante, o
+ * de un modelo de ML después) imprime una línea con el color
+ * aplicado. En `false` (valor por defecto), no imprime nada, para no
+ * contaminar el log de los sensores (`IMU:`, `GSR:`, `PPG:`) con
+ * líneas de LEDs durante uso normal.
+ */
+const bool DEBUG_LEDS = false;
+
+/**
+ * Pin del canal verde (G) del LED RGB.
+ */
+const uint8_t LED_PIN_G = 9;
+
+/**
+ * Pin del canal rojo (R) del LED RGB.
+ * Fisicamente conectado a D8, pero el core cambia el mapeo a D10.
+ * TODO: Track https://github.com/FastLED/FastLED/issues/2061
+ */
+const uint8_t LED_PIN_R = 10;
+
+/**
+ * Pin del canal azul (B) del LED RGB.
+ */
+const uint8_t LED_PIN_B = 0;
+
+/**
+ * Configura como salida los tres pines del LED RGB y los deja
+ * apagados.
+ *
+ * Los MOSFET de este circuito están cableados a tierra: llevar el
+ * pin a HIGH activa el gate, drena el LED a tierra y lo enciende;
+ * LOW lo apaga. `setLedColor()` asume esta misma convención.
+ *
+ * Antes de declarar cada pin como salida, se fuerza brevemente un
+ * pull-down interno (`INPUT_PULLDOWN`). Esto evita que, mientras el
+ * pin todavía es una entrada (el instante justo en que el firmware
+ * toma control, antes de esta llamada), el gate del MOSFET quede en
+ * un nivel indefinido/flotante que active el LED parcialmente; con
+ * el pull-down, ese nivel queda anclado a LOW. No usa `delay()`: el
+ * cambio de modo es instantáneo, no hay que esperar nada.
+ */
+void setupLeds()
+{
+    pinMode(LED_PIN_R, INPUT_PULLDOWN);
+    pinMode(LED_PIN_G, INPUT_PULLDOWN);
+    pinMode(LED_PIN_B, INPUT_PULLDOWN);
+
+    pinMode(LED_PIN_R, OUTPUT);
+    pinMode(LED_PIN_G, OUTPUT);
+    pinMode(LED_PIN_B, OUTPUT);
+
+    digitalWrite(LED_PIN_R, LOW);
+    digitalWrite(LED_PIN_G, LOW);
+    digitalWrite(LED_PIN_B, LOW);
+}
+
+/**
+ * Enciende o apaga, de forma independiente, cada canal del LED RGB.
+ *
+ * Función reusable de bajo nivel: cualquier rutina que quiera
+ * mostrar un color en el LED (la demostración `TEST` de hoy, una
+ * animación basada en sensores más adelante, o una controlada por
+ * ML después) pasa por aquí en vez de escribir los pines
+ * directamente. Al ser el único punto de escritura, también es el
+ * único lugar donde hace falta chequear `DEBUG_LEDS` para imprimir
+ * el estado por serial: cualquier rutina que llame a esta función
+ * obtiene ese log gratis, sin tener que implementarlo ella misma.
+ *
+ * Los MOSFET son a tierra, así que HIGH = encendido (activa el
+ * MOSFET, drena el LED a tierra) y LOW = apagado.
+ *
+ * Args:
+ *     red: `true` para encender el canal rojo, `false` para apagarlo.
+ *     green: `true` para encender el canal verde, `false` para apagarlo.
+ *     blue: `true` para encender el canal azul, `false` para apagarlo.
+ */
+void setLedColor(bool red, bool green, bool blue)
+{
+    digitalWrite(LED_PIN_R, red ? HIGH : LOW);
+    digitalWrite(LED_PIN_G, green ? HIGH : LOW);
+    digitalWrite(LED_PIN_B, blue ? HIGH : LOW);
+
+    if (DEBUG_LEDS) {
+        Serial.print("# LED: R=");
+        Serial.print(red ? 1 : 0);
+        Serial.print(" G=");
+        Serial.print(green ? 1 : 0);
+        Serial.print(" B=");
+        Serial.println(blue ? 1 : 0);
+    }
+}
+
+// --- TEST: demostración R -> G -> B -> Todos -> Ninguno ---
+//
+// Rutina temporal, solo para verificar el cableado del LED RGB. Se
+// ejecuta siempre, incluso si ningún sensor fue detectado. Más
+// adelante se elimina y se reemplaza por una animación basada en los
+// datos de los sensores. No bloqueante: se turna con el resto del
+// `loop()` usando `millis()`, igual que el resto del programa.
+
+/** Duración de cada paso de la demostración (cada color), en ms. */
+const unsigned long LED_TEST_STEP_MS = 1000;
+
+/** Pasos de la demostración: R, luego G, luego B, luego todos, luego ninguno. */
+enum LedTestStep {
+    LED_TEST_STEP_RED = 0,
+    LED_TEST_STEP_GREEN,
+    LED_TEST_STEP_BLUE,
+    LED_TEST_STEP_ALL,
+    LED_TEST_STEP_NONE
+};
+
+LedTestStep ledTestStep = LED_TEST_STEP_RED;
+unsigned long ledTestStepStart = 0;
+
+// Prototipo explícito: el generador automático de prototipos del IDE
+// de Arduino puede fallar al inferir el tipo `LedTestStep` (un enum
+// definido en este mismo archivo) si se declara justo antes de su
+// primer uso como parámetro. Declararlo a mano aquí evita el error
+// "was not declared in this scope" al compilar.
+void applyLedTestStep(LedTestStep step);
+
+/**
+ * Aplica el color del paso actual de la demostración.
+ *
+ * Solo se llama una vez por paso (ver `updateLedTest()`), no en cada
+ * vuelta de `loop()`. La impresión por serial del color aplicado (si
+ * `DEBUG_LEDS` está activo) ocurre dentro de `setLedColor()`, no
+ * aquí, para que cualquier otra rutina que la use más adelante
+ * (animación por sensores, luego por ML) obtenga el mismo log sin
+ * duplicar esta lógica.
+ *
+ * Args:
+ *     step: Paso de la demostración a aplicar.
+ */
+void applyLedTestStep(LedTestStep step)
+{
+    switch (step) {
+        case LED_TEST_STEP_RED:
+            setLedColor(true, false, false);
+            break;
+
+        case LED_TEST_STEP_GREEN:
+            setLedColor(false, true, false);
+            break;
+
+        case LED_TEST_STEP_BLUE:
+            setLedColor(false, false, true);
+            break;
+
+        case LED_TEST_STEP_ALL:
+            setLedColor(true, true, true);
+            break;
+
+        case LED_TEST_STEP_NONE:
+            setLedColor(false, false, false);
+            break;
+    }
+}
+
+/**
+ * Avanza la demostración `TEST` del LED RGB sin bloquear el resto del
+ * programa: R, luego G, luego B, luego todos encendidos, luego
+ * ninguno, cada uno durante `LED_TEST_STEP_MS` (1 s), y al terminar
+ * repite el ciclo desde R.
+ *
+ * Se ejecuta siempre desde `loop()`, sin depender de que algún sensor
+ * haya sido detectado.
+ */
+void updateLedTest()
+{
+    unsigned long now = millis();
+
+    // Al arrancar (o justo al cambiar de paso) el color aún no se ha
+    // aplicado ni impreso; se hace aquí, una sola vez por paso.
+    static bool stepApplied = false;
+    if (!stepApplied) {
+        applyLedTestStep(ledTestStep);
+        stepApplied = true;
+    }
+
+    unsigned long elapsed = now - ledTestStepStart;
+    if (elapsed < LED_TEST_STEP_MS) return;
+
+    ledTestStepStart = now;
+    stepApplied = false;
+
+    switch (ledTestStep) {
+        case LED_TEST_STEP_RED:   ledTestStep = LED_TEST_STEP_GREEN; break;
+        case LED_TEST_STEP_GREEN: ledTestStep = LED_TEST_STEP_BLUE;  break;
+        case LED_TEST_STEP_BLUE:  ledTestStep = LED_TEST_STEP_ALL;   break;
+        case LED_TEST_STEP_ALL:   ledTestStep = LED_TEST_STEP_NONE;  break;
+        case LED_TEST_STEP_NONE:  ledTestStep = LED_TEST_STEP_RED;   break;
+    }
+}
 
 /**
  * Imprime por serial una línea de datos de sensor etiquetada.
@@ -198,21 +438,25 @@ void quaternionToEuler(
 /**
  * Inicializa el IMU BNO085 por I2C y habilita el vector de rotación.
  *
- * Detiene la ejecución si el sensor no es detectado o el reporte no
- * puede habilitarse, para evitar operar sin datos válidos de
- * orientación.
+ * Si el sensor no es detectado o el reporte no puede habilitarse, se
+ * reporta el fallo por serial y `imuAvailable` queda en `false`: el
+ * programa continúa (no se congela), para que el resto de sensores y
+ * la demostración de LEDs sigan funcionando aunque este sensor no
+ * esté conectado.
  */
 void setupIMU()
 {
     if (!bno08x.begin_I2C(IMU_I2C_ADDR)) {
         Serial.println("# BNO085 no detectado");
-        while (1);
+        return;
     }
 
     if (!bno08x.enableReport(SH2_ROTATION_VECTOR)) {
         Serial.println("# Rotation Vector fallo");
-        while (1);
+        return;
     }
+
+    imuAvailable = true;
 }
 
 /**
@@ -224,6 +468,7 @@ void setupIMU()
  */
 void readIMU()
 {
+    if (!imuAvailable) return;
     if (!bno08x.getSensorEvent(&imuEvent)) return;
     if (imuEvent.sensorId != SH2_ROTATION_VECTOR) return;
 
@@ -287,14 +532,16 @@ void readGSR()
  * promediado en hardware para reducir ruido antes del filtrado en
  * software) y deja los LEDs encendidos en espera de un dedo.
  *
- * Detiene la ejecución si el sensor no es detectado, para evitar
- * operar sin datos válidos de pulso/oxigenación.
+ * Si el sensor no es detectado, se reporta el fallo por serial y
+ * `ppgAvailable` queda en `false`: el programa continúa (no se
+ * congela), para que el resto de sensores y la demostración de LEDs
+ * sigan funcionando aunque este sensor no esté conectado.
  */
 void setupPPG()
 {
     if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
         Serial.println("# MAX30102 no detectado");
-        while (1);
+        return;
     }
 
     byte ledBrightness = 60;   // 0-255
@@ -305,6 +552,8 @@ void setupPPG()
     int adcRange = 4096;
 
     particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+
+    ppgAvailable = true;
 }
 
 /**
@@ -376,6 +625,7 @@ void recalculateSpo2()
  */
 void readPPG()
 {
+    if (!ppgAvailable) return;
     if (!particleSensor.safeCheck(0)) return;
 
     while (particleSensor.available()) {
@@ -433,8 +683,12 @@ void readPPG()
 }
 
 /**
- * Inicializa la comunicación serial y los tres sensores (IMU, GSR y
- * PPG).
+ * Inicializa la comunicación serial, los tres sensores (IMU, GSR y
+ * PPG) y el LED RGB.
+ *
+ * Un sensor no detectado no impide que el resto del `setup()` ni el
+ * `loop()` continúen: `setupIMU()` y `setupPPG()` solo reportan el
+ * fallo por serial y marcan el sensor como no disponible.
  */
 void setup()
 {
@@ -445,16 +699,23 @@ void setup()
     setupIMU();
     setupGSR();
     setupPPG();
+    setupLeds();
+
+    ledTestStepStart = millis();
 }
 
 /**
- * Bucle principal: revisa los tres sensores en cada iteración de
- * forma independiente y no bloqueante, preservando la integridad
- * temporal de cada lectura.
+ * Bucle principal: revisa los tres sensores y actualiza la
+ * demostración del LED RGB en cada iteración, todo de forma
+ * independiente y no bloqueante, preservando la integridad temporal
+ * de cada lectura. La demostración de LEDs corre siempre, incluso si
+ * ningún sensor fue detectado.
  */
 void loop()
 {
     readIMU();
     readGSR();
     readPPG();
+
+    updateLedTest();  // TEST: eliminar cuando se reemplace por la animación real
 }
